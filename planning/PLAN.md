@@ -454,3 +454,72 @@ The container is designed to deploy to AWS App Runner, Render, or any container 
 - Portfolio visualization: heatmap renders with correct colors, P&L chart has data points
 - AI chat (mocked): send a message, receive a response, trade execution appears inline
 - SSE resilience: disconnect and verify reconnection
+
+---
+
+## 13. Review Feedback: Questions, Clarifications & Suggested Improvements
+
+*Review date: 2026-10-01. Each item is tagged **[Q]** (a question that needs a decision), **[C]** (an ambiguity to clarify), or **[S]** (a suggested improvement). Items marked ⚠️ are likely to lead agents to build pieces that don't fit together if they stay unresolved.*
+
+### 13.1 Market Data & SSE
+
+1. ⚠️ **[C] "Daily change %" has no defined baseline.** §10 asks the watchlist to show daily change %. However, `PriceUpdate` only carries `price` and `previous_price` (the prior tick), so its `change_percent` measures tick-to-tick change, not daily change. Pick a baseline. For the simulator, that could be the seed price or the first price seen since server start; for Massive, the previous close (`prevDay` in the snapshot response). Then add a `session_open` (or `day_open`) field to `PriceUpdate` and the SSE payload.
+2. **[C] The SSE event shape differs from §6.** §6 says "each SSE event contains ticker, price, previous price…". The implemented `stream.py` instead sends one event per tick that holds a **dict of all tickers** (`{"AAPL": {...}, "GOOGL": {...}}`). Update §6 to match the actual payload, so the frontend agent codes against what the backend really sends.
+3. ⚠️ **[Q] Ticker validation when adding to the watchlist.** The simulator accepts any string and seeds it at a random price between $50 and $300. As a result, `POST /api/watchlist {"ticker": "ZZZZ"}`, or a typo from the LLM, silently becomes a "real" stock. Options: an allowlist of known symbols in simulator mode, a format check (`^[A-Z.]{1,5}$`), and validation against Massive in real-data mode. Specify the error response too.
+4. **[C] Pricing tickers that aren't on the watchlist.** If a user holds a position and then removes that ticker from the watchlist, does the data source stop tracking it? If so, the position can no longer be valued. Suggestion: the tracked set is the watchlist plus all open positions, and removing a held ticker from the watchlist only hides it from the watchlist UI.
+5. **[C] Trading a ticker with no cached price.** A trade can arrive for a ticker that was just added and has no price yet. This is especially likely with Massive's 15-second poll. Suggestion: reject the trade with a clear "price not yet available" error, rather than filling at 0 or blocking.
+6. **[S] Sparkline and main chart history on page load.** Charts start empty on every refresh. With Massive at 15-second intervals, the main chart stays nearly blank for minutes. Consider a lightweight in-memory ring buffer (for example, the last ~5 minutes per ticker) exposed via `GET /api/prices/history/{ticker}`, so the frontend can backfill on load. This is optional, but it noticeably improves the first impression the vision promises.
+
+### 13.2 Portfolio & Trading
+
+7. ⚠️ **[C] Trade request/response contract.** Define the exact response of `POST /api/portfolio/trade` (for example, `{trade, position, cash_balance}`) and the error shape (for example, HTTP 400 with `{"error": "...", "code": "INSUFFICIENT_CASH"}`). The chat flow reuses this logic, so a shared list of error codes helps the LLM explain failures consistently.
+8. **[C] Quantity rules.** Fractional shares are supported, but:
+   - Is there a minimum quantity (for example, 0.0001), and what precision is used for storage and display?
+   - Must quantity be greater than 0?
+   - Is `side` case-insensitive?
+   - How is cash rounded? REAL floats accumulate error, so consider rounding to cents on every write.
+9. **[C] Average cost and realized P&L.** Specify the rules: buys update a weighted average cost, sells leave average cost unchanged, and the position row is deleted when quantity reaches 0 (or falls within an epsilon of 0, given float math). Realized P&L isn't tracked anywhere. Is that intentional? If the header or chat should report it, it needs its own column or must be derived from `trades`.
+10. **[C] Response shape of `GET /api/portfolio`.** List the fields explicitly: cash, total_value, and positions[] with ticker, quantity, avg_cost, current_price, market_value, unrealized_pnl, pnl_percent and weight. The heatmap needs `weight` and the header needs `total_value`, so pinning this down prevents the frontend and backend from drifting apart.
+11. **[C] How the header value updates live.** Is the header's total value computed on the frontend from SSE prices × positions, or polled from `/api/portfolio`? Recommendation: compute it on the frontend from SSE, and refetch `/api/portfolio` after each trade or chat action.
+12. **[C] Snapshot retention and history range.** A snapshot every 30 seconds adds about 2,900 rows per day, and the table grows forever. Questions to settle:
+   - Is there a retention or downsampling rule, or is unbounded growth acceptable for a demo?
+   - Does `GET /api/portfolio/history` accept a range or limit parameter?
+   - Are snapshots recorded when the user holds no positions (a flat line at the cash value)?
+13. **[Q] Resetting the portfolio.** The only way to get back to $10,000 is to delete the Docker volume. A `POST /api/portfolio/reset` endpoint, plus a small UI button, would help both demos and E2E test isolation.
+
+### 13.3 LLM / Chat
+
+14. ⚠️ **[C] Chat response contract.** Specify the `POST /api/chat` response that the frontend renders, including a result for each action. For example: `{message, actions: {trades: [{ticker, side, quantity, price, status: "executed"|"failed", error?}], watchlist_changes: [...]}}`. §9 also says failures are "included in the chat response so the LLM can inform the user", but the LLM has already replied by the time trades execute. Clarify which approach applies: (a) a second LLM call summarizes the outcomes, or (b) the backend appends failure notes to the message, or returns them as structured action results for the UI to render. Option (b) is simpler and is the recommendation.
+15. **[C] How much conversation history is loaded.** How many prior messages go into the prompt (for example, the last 20)? Are previous `actions` included, so the model knows what it has already done?
+16. **[C] Behavior of mock mode.** Define the deterministic mock responses so E2E tests can assert on them. For example, a message containing "buy" returns a 1-share AAPL buy, and anything else returns a fixed text reply. Without this, the E2E scenario "trade execution appears inline" can't be written.
+17. **[C] Missing API key and LLM errors.** If `OPENROUTER_API_KEY` is absent and `LLM_MOCK` is false, does the app still start, with chat returning a friendly error? Also define a timeout, and what happens when the structured output is malformed. Suggestion: retry once, then show an error message to the user and execute nothing.
+18. **[S] Limits on autonomous trades.** Even with fake money, consider capping the number of trades per chat response (for example, 10). State explicitly that each trade is validated on its own, so some trades in a response can succeed while others fail.
+
+### 13.4 Watchlist
+
+19. **[C] Duplicate and missing tickers.** Does adding a ticker that is already listed return 409, or an idempotent 200? Does removing a ticker that isn't listed return 404 or 204? Normalize tickers to uppercase on the server.
+20. **[C] Response shape of `GET /api/watchlist`.** Define the fields (ticker, price, previous_price, change_percent, direction, added_at), and what is returned when no price is cached yet (`null`).
+
+### 13.5 Frontend
+
+21. **[C] Charting library.** §10 says "Lightweight Charts or Recharts" and also "canvas-based preferred", but Recharts renders SVG, not canvas. Pick one. Lightweight Charts is the natural fit for the price and P&L charts. The treemap needs a separate solution: Recharts `Treemap`, d3-hierarchy, or a custom CSS grid.
+22. **[C] Default selected ticker.** Which ticker does the main chart show before the user clicks one? The first watchlist entry is a reasonable default.
+23. **[S] Link the trade bar to the selection.** Clicking a watchlist row could pre-fill the ticker in the trade bar. It's a cheap UX win.
+24. **[C] E2E test for SSE resilience.** "Disconnect and verify reconnection" is hard to do in Playwright against a single container. Specify the mechanism, for example `page.route` to abort `/api/stream/prices`, or `context.setOffline(true)`. Also specify what the UI must show: the status dot goes yellow, then back to green.
+
+### 13.6 Infrastructure, Ops & Docs
+
+25. **[C] Loading `.env`.** §5 says the backend "reads `.env` from the project root", but in Docker the variables are passed via `--env-file`. Clarify that local development uses `python-dotenv` (or `uv run --env-file`) while the container relies on Docker environment variables, and that the app must not fail when `.env` is missing.
+26. **[C] Configuring the database path.** The database lives at `db/finally.db` locally but at `/app/db/finally.db` in the container. Recommendation: a `DB_PATH` environment variable whose default resolves relative to the project root, so tests can point it at a temporary file.
+27. **[C] Lazy initialization or startup initialization.** §4 says the backend "lazily initializes the database on first request", while §7 says "on startup (or first request)". Recommendation: initialize at startup (FastAPI lifespan). It is simpler, and it avoids races between concurrent first requests and the snapshot background task.
+28. **[C] SPA fallback and static routing.** With a single-page static export, confirm two things: `/` serves `index.html`, and the `/api/*` routes are registered before the static mount so the mount doesn't shadow them. Also define how unknown `/api/*` paths return 404: as JSON, not the HTML page.
+29. **[S] Concurrent writes to SQLite.** The background snapshot task, manual trades and chat-driven trades can all write at the same time. Recommendations:
+   - Use a single connection guarded by a lock, or enable WAL mode.
+   - Wrap each trade in one transaction: cash update, position upsert, trade insert and snapshot.
+30. **[C] What the health check verifies.** Should `/api/health` check database connectivity and confirm the market data task is running, or just return 200? Add a matching `HEALTHCHECK` to the Dockerfile.
+31. **[S] `docker-compose.yml` versus the scripts.** Both are listed. State which one is canonical so they don't drift apart (for example, the scripts call `docker compose`).
+32. **[S] A single API contract document.** §1 says agents interact through files in `planning/`. Consider adding a short `planning/API_CONTRACT.md` that records the concrete request/response JSON for every endpoint and the SSE payload (items 2, 7, 10, 14 and 20). Frontend and backend agents would then build against one shared contract. This is the most valuable improvement in this review.
+
+### 13.7 Suggested Priority
+
+Resolve these before frontend and backend work runs in parallel: **1, 2, 3, 4, 7, 10, 14, 16, 21, 32**. The implementing agent can decide the rest and document each decision as it goes.
